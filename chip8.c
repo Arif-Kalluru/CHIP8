@@ -5,11 +5,26 @@
 #include <time.h>
 #include "SDL.h"
 
+/* macros */
 #define SCREEN_WIDTH 64
 #define SCREEN_HEIGHT 32
 
+#define ROM_ENTRY_POINT 0x200      // Most programs written for the original system begin at memory location 512 (0x200)
+#define FONT_ENTRY_POINT 0x50      // Anywhere in the first 512 bytes (000–1FF) is fine. It’s become popular to put it at 050–09F
+#define DISPLAY_ENTRY_POINT 0xF00  // RAM[0xF00 ~ 0xFFF] 256 bytes = 2048 bits = 64 x 32
+#define HIGHEST_ADDRESS 0xFFF      // 12 bit address, highest address at 0xFFF (4095)
+
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+/* enums */
+// Emulator states
+typedef enum {
+    QUIT,
+    RUNNING,
+    PAUSED
+} emulator_state_t;
+
+/* typedefs */
 // SDL Object
 typedef struct {
     SDL_Window *window;
@@ -25,40 +40,24 @@ typedef struct {
     uint16_t insts_per_second;  // Number of CHIP8 instructions to emulate per second
 } config_t;
 
-// Emulator states
-typedef enum {
-    QUIT,
-    RUNNING,
-    PAUSED
-} emulator_state_t;
-
-// CHIP8 Instruction format
-// CHIP-8 has 35 opcodes, which are all two bytes long and stored big-endian.
-typedef struct {
-    uint16_t opcode;
-    uint16_t NNN;     // 12 bit address
-    uint8_t NN;       // 8 bit constant
-    uint8_t N;        // 4 bit constanst
-    uint8_t X;        // 4 bit register identifier
-    uint8_t Y;        // 4 bit register identifier
-} instruction_t;
-
 // CHIP8 Machine object
 typedef struct {
     emulator_state_t state;  // state of machine
     uint8_t ram[4096];
-    bool display[64*32];     // Should have be in ram[0xF00 ~ 0xFFF]
+    uint8_t *display;        // ram[0xF00 ~ 0xFFF] (64 * 32 bits = 2048 bits = 256 bytes)
     uint16_t stack[12];      // Subroutine stack. 12 levels of nesting, 48 Bytes max
     uint8_t SP;              // Stack Pointer
     uint8_t V[16];           // V0 to VF
     uint16_t I;              // Index register
     uint16_t PC;             // Program Counter
-    uint8_t delay_timer;      // Count down at 60 hz when > 0
-    uint8_t sound_timer;      // Count down at 60 hzr when > 0. A beeping sound is made when > 0
+    uint8_t delay_timer;     // Count down at 60 hz when > 0
+    uint8_t sound_timer;     // Count down at 60 hzr when > 0. A beeping sound is made when > 0
     bool keypad[16];         // Hexadecimal keypad 0x0 to 0xF
-    instruction_t inst;      // Currently executing instruction
     const char *rom_name;    // Currently running rom
 } chip8_t;
+
+/* function declarations */
+
 
 // Set up initial emulator configuration from passed in arguments
 static bool set_config_from_args(config_t *config, const int argc, char **argv)
@@ -73,13 +72,13 @@ static bool set_config_from_args(config_t *config, const int argc, char **argv)
     // Override defaults from passed in arguments
     for (int i = 1; i < argc; i++) {
         (void)argv[i];
-        // !!!--- TODO
+        // TODO
     }
 
     return true;
 }
 
-// Initialize SDL
+// Initialize SDL Object
 static bool init_sdl(sdl_t *sdl, const config_t config)
 {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) != 0) {
@@ -109,20 +108,18 @@ static bool init_sdl(sdl_t *sdl, const config_t config)
 // Initialize CHIP8 machine
 static bool init_chip8(chip8_t *chip8, const char *rom_name)
 {
-    const uint16_t entry_point = 0x200;          // Most programs begin at memory location 512 (0x200)
-
     /*
-        There are sixteen characters that ROMs expected at a certain location so they can write
-        characters to the screen, so we need to put those characters into memory.
-        Each character sprite is five bytes.  The character F, for example,
-        is 0xF0, 0x80, 0xF0, 0x80, 0x80. Take a look at the binary representation:
-
-        11110000
-        10000000
-        11110000
-        10000000
-        10000000
-    */
+     * There are sixteen characters that ROMs expected at a certain location so they can write
+     *  characters to the screen, so we need to put those characters into memory.
+     *  Each character sprite is five bytes.  The character F, for example,
+     *  is 0xF0, 0x80, 0xF0, 0x80, 0x80. Take a look at the binary representation:
+     *
+     *  11110000
+     *  10000000
+     *  11110000
+     *  10000000
+     *  10000000
+     */
 
     const uint8_t font[] = {
         0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
@@ -145,7 +142,7 @@ static bool init_chip8(chip8_t *chip8, const char *rom_name)
 
     // Load font
     // Anywhere in the first 512 bytes (000–1FF) is fine. For some reason, it’s become popular to put it at 050–09F
-    memcpy(&chip8->ram[0], font, sizeof(font));
+    memcpy(&chip8->ram[FONT_ENTRY_POINT], font, sizeof(font));
 
     // Open ROM file
     FILE *rom = fopen(rom_name, "rb");
@@ -157,7 +154,7 @@ static bool init_chip8(chip8_t *chip8, const char *rom_name)
     // Find ROM size
     fseek(rom, 0, SEEK_END);
     const size_t rom_size = ftell(rom);
-    const size_t max_size = sizeof chip8->ram - entry_point;
+    const size_t max_size = sizeof chip8->ram - ROM_ENTRY_POINT - (HIGHEST_ADDRESS - DISPLAY_ENTRY_POINT);
     fseek(rom, 0, SEEK_SET);
 
     if (rom_size > max_size) {
@@ -165,7 +162,7 @@ static bool init_chip8(chip8_t *chip8, const char *rom_name)
         return false;
     }
 
-    if (fread(&chip8->ram[entry_point], rom_size, 1, rom) != 1) {
+    if (fread(&chip8->ram[ROM_ENTRY_POINT], rom_size, 1, rom) != 1) {
         // Load ROM into RAM
         SDL_Log("Could not read ROM file into CHIP8 memory\n");
         return false;
@@ -173,10 +170,11 @@ static bool init_chip8(chip8_t *chip8, const char *rom_name)
     fclose(rom);
 
     // Set chip8 machine defaults
-    chip8->state = RUNNING;   // Set default machine state to running
-    chip8->PC = entry_point;  // Start PC at ROM entry point
-    chip8->SP = 0;            // Top of stack is at 0
+    chip8->state = RUNNING;                 // Set default machine state to running
+    chip8->PC = ROM_ENTRY_POINT;  // Start PC at ROM entry point
+    chip8->SP = 0;                // Top of stack is at 0
     chip8->rom_name = rom_name;
+    chip8->display = &chip8->ram[DISPLAY_ENTRY_POINT];  // ram[0xF00 ~ 0xFFF]
 
     return true;
 }
@@ -194,7 +192,7 @@ static bool init_chip8(chip8_t *chip8, const char *rom_name)
     |A|0|B|F|    |z|x|c|v|
     +-+-+-+-+    +-+-+-+-+
 */
-static void handle_input(chip8_t *chip8)
+static void process_events(chip8_t *chip8)
 {
     SDL_Event event;
 
@@ -381,6 +379,29 @@ static void clear_screen(const sdl_t sdl, const config_t config)
     SDL_RenderClear(sdl.renderer);
 }
 
+// Returns non-zero if pixel is on, or 0 if pixel is off
+static uint8_t get_screen_pixel(const chip8_t chip8, const uint8_t x, const uint8_t y)
+{
+    uint16_t bit_index = y * SCREEN_WIDTH + x;
+    uint8_t byte_index = bit_index / 8;  // range from 0 ~ 255 (64 x 32 bits = 256 bytes)
+    uint8_t offset = bit_index % 8;
+    return chip8.display[byte_index] & (0x80 >> offset);
+}
+
+// Set screen pixel bit to 1 if on is true, else resets screen pixel to 0
+static void set_screen_pixel(chip8_t *chip8, uint8_t x, uint8_t y, bool on)
+{
+    uint16_t bit_index = y * SCREEN_WIDTH + x;
+    uint8_t byte_index = bit_index / 8;  // range from 0 ~ 255 (64 x 32 bits = 256 bytes)
+    uint8_t offset = bit_index % 8;
+
+    if (on) {
+        chip8->display[byte_index] |= (0x80 >> offset);
+    } else {
+        chip8->display[byte_index] &= (~(0x80 >> offset));
+    }
+}
+
 // Update window with any changes
 static void update_screen(const sdl_t sdl, const config_t config, const chip8_t chip8)
 {
@@ -406,8 +427,7 @@ static void update_screen(const sdl_t sdl, const config_t config, const chip8_t 
             rect.x = x * config.scale_factor;
             rect.y = y * config.scale_factor;
 
-            uint16_t index = y * SCREEN_WIDTH + x;
-            if (chip8.display[index]) {
+            if (get_screen_pixel(chip8, x, y)) {
                 // If pixel is on, set renderer to foreground color
                 SDL_SetRenderDrawColor(sdl.renderer, fg_r, fg_g, fg_b, fg_a);
             } else {
@@ -439,24 +459,26 @@ static void emulate_instruction(chip8_t *chip8)
 {
     // CHIP-8 opcodes are all two bytes long and stored big-endian.
     // Get next opcode from RAM
-    chip8->inst.opcode = (chip8->ram[chip8->PC] << 8 | chip8->ram[chip8->PC + 1]);
+    uint16_t opcode = (chip8->ram[chip8->PC] << 8 | chip8->ram[chip8->PC + 1]);
     chip8->PC += 2;  // Increment PC for next opcode
 
-    // Fill out instruction format
+    // CHIP8 Instruction format
+    // CHIP-8 has 35 opcodes, which are all two bytes long and stored big-endian.
     // Ex: 1NNN, 4XNN, 6XNN, DXYN
-    chip8->inst.NNN = chip8->inst.opcode & 0xFFF;
-    chip8->inst.NN = chip8->inst.opcode & 0xFF;
-    chip8->inst.N = chip8->inst.opcode & 0xF;
-    chip8->inst.X = (chip8->inst.opcode >> 8) & 0xF;
-    chip8->inst.Y = (chip8->inst.opcode >> 4) & 0xF;
+    uint16_t NNN = opcode & 0xFFF;    // 12 bit address
+    uint8_t NN = opcode & 0xFF;       // 8 bit constant
+    uint8_t N = opcode & 0xF;         // 4 bit constant
+    uint8_t X = (opcode >> 8) & 0xF;  // 4 bit register identifier
+    uint8_t Y = (opcode >> 4) & 0xF;  // 4 bit register identifier
 
     // Emulate opcode
-    switch ((chip8->inst.opcode >> 12) & 0xF) {
+    switch ((opcode >> 12) & 0xF) {
         case 0x0:
-            if (chip8->inst.NN == 0xE0) {
+            if (NN == 0xE0) {
                 // 0x00E0: Clears the screen
-                memset(&chip8->display[0], false, sizeof(chip8->display));  // RAM[0xF00 ~ 0xFFF] (256 Bytes)
-            } else if (chip8->inst.NN == 0xEE) {
+                const int bytes = 256;  // RAM[0xF00 ~ 0xFFF]
+                memset(&chip8->display[0], 0, bytes);
+            } else if (NN == 0xEE) {
                 // 0x00EE: Returns from a subroutine
                 // With each RET, the stack pointer is decremented by
                 // one and the address that it’s pointing to is put into
@@ -471,7 +493,7 @@ static void emulate_instruction(chip8_t *chip8)
 
         case 0x1:
             // 0x1NNN: Jumps to address NNN
-            chip8->PC = chip8->inst.NNN;  // Set PC to NNN
+            chip8->PC = NNN;  // Set PC to NNN
             break;
 
         case 0x2:
@@ -480,101 +502,101 @@ static void emulate_instruction(chip8_t *chip8)
             // incremented to point to the next instruction) is placed
             // where the SP was pointing, and the SP is incremented.
             chip8->stack[chip8->SP] = chip8->PC;
-            chip8->PC = chip8->inst.NNN;
+            chip8->PC = NNN;
             chip8->SP += 1;
             break;
 
         case 0x3:
             // 0x3XNN: Skips the next instruction if VX equals NN
-            if (chip8->V[chip8->inst.X] == chip8->inst.NN)
+            if (chip8->V[X] == NN)
                 chip8->PC += 2;
             break;
 
         case 0x4:
             // 0x4XNN: Skips the next instruction if VX does not equal NN
-            if (chip8->V[chip8->inst.X] != chip8->inst.NN)
+            if (chip8->V[X] != NN)
                 chip8->PC += 2;
             break;
 
         case 0x5:
             // 0x5XY0: Skips the next instruction if VX equals VY
-            if (chip8->V[chip8->inst.X] == chip8->V[chip8->inst.Y])
+            if (chip8->V[X] == chip8->V[Y])
                 chip8->PC += 2;
             break;
 
         case 0x6:
             // 0x6XNN: Sets VX to NN.
-            chip8->V[chip8->inst.X] = chip8->inst.NN;
+            chip8->V[X] = NN;
             break;
 
         case 0x7:
             // 0x7XNN: Vx += NN, Adds NN to VX (carry flag is not changed).
-            chip8->V[chip8->inst.X] += chip8->inst.NN;
+            chip8->V[X] += NN;
             break;
 
         case 0x8:
-            switch (chip8->inst.N) {
+            switch (N) {
                 case 0x0:
                     // 0x8XY0: Sets VX to the value of VY.
-                    chip8->V[chip8->inst.X] = chip8->V[chip8->inst.Y];
+                    chip8->V[X] = chip8->V[Y];
                     break;
 
                 case 0x1:
                     // 0x8XY1: Sets VX |= VY
-                    chip8->V[chip8->inst.X] |= chip8->V[chip8->inst.Y];
+                    chip8->V[X] |= chip8->V[Y];
                     break;
 
                 case 0x2:
                     // 0x8XY2: Sets VX &= VY
-                    chip8->V[chip8->inst.X] &= chip8->V[chip8->inst.Y];
+                    chip8->V[X] &= chip8->V[Y];
                     break;
 
                 case 0x3:
                     // 0x8XY3: Sets VX ^= VY
-                    chip8->V[chip8->inst.X] ^= chip8->V[chip8->inst.Y];
+                    chip8->V[X] ^= chip8->V[Y];
                     break;
 
                 case 0x4:
                     // 0x8XY4: Adds VY to VX. VF is set to 1 when VX + VY > FF
-                    uint16_t sum = chip8->V[chip8->inst.X] + chip8->V[chip8->inst.Y];
+                    uint16_t sum = chip8->V[X] + chip8->V[Y];
                     if (sum > 0xFF) {
                         chip8->V[0xF] = 1;
                     } else {
                         chip8->V[0xF] = 0;
                     }
-                    chip8->V[chip8->inst.X] += chip8->V[chip8->inst.Y];
+                    chip8->V[X] += chip8->V[Y];
                     break;
 
                 case 0x5:
                     // 0x8XY5: VY is subtracted from VX. VF = 00 if VX < VY, VF = 01 if VX >= VY
-                    if (chip8->V[chip8->inst.X] >= chip8->V[chip8->inst.Y]) {
+                    if (chip8->V[X] >= chip8->V[Y]) {
                         chip8->V[0xF] = 1;
                     } else {
                         chip8->V[0xF] = 0;
                     }
-                    chip8->V[chip8->inst.X] -= chip8->V[chip8->inst.Y];
+                    chip8->V[X] -= chip8->V[Y];
                     break;
 
                 case 0x6:
                     // 0x8XY6: Stores the least significant bit of VX in VF and then shifts VX to the right by 1
-                    chip8->V[0xF] = chip8->V[chip8->inst.X] & 0x1;
-                    chip8->V[chip8->inst.X] >>= 1;
+                    chip8->V[0xF] = chip8->V[X] & 0x1;
+                    chip8->V[X] >>= 1;
                     break;
 
                 case 0x7:
                     // 0x8XY7: Sets VX to VY minus VX. VF = 00 if VX >= VY, VF = 01 if VX < VY
-                    if (chip8->V[chip8->inst.Y] > chip8->V[chip8->inst.X]) {
+                    if (chip8->V[Y] > chip8->V[X]) {
                         chip8->V[0xF] = 1;
                     } else {
                         chip8->V[0xF] = 0;
                     }
-                    chip8->V[chip8->inst.X] = chip8->V[chip8->inst.Y] - chip8->V[chip8->inst.X];
+                    chip8->V[X] = chip8->V[Y] - chip8->V[X];
                     break;
 
                 case 0xE:
                     // 0x8XYE: Stores the most significant bit of VX in VF and then shifts VX to the left by 1.
-                    chip8->V[0xF] = (chip8->V[chip8->inst.X] & 0x80) >> 7;
-                    chip8->V[chip8->inst.X] <<= 1;
+                    chip8->V[0xF] = (chip8->V[X] & 0x80) >> 7;
+                    chip8->V[X] <<= 1;
                     break;
 
                 default:
@@ -584,23 +606,23 @@ static void emulate_instruction(chip8_t *chip8)
 
         case 0x9:
             // 0x9XY0: Skips the next instruction if VX does not equal VY
-            if (chip8->V[chip8->inst.X] != chip8->V[chip8->inst.Y])
+            if (chip8->V[X] != chip8->V[Y])
                 chip8->PC += 2;
             break;
 
         case 0xA:
             // 0xANNN: Sets Index register I to the address NNN.
-            chip8->I = chip8->inst.NNN;
+            chip8->I = NNN;
             break;
 
         case 0xB:
             // 0xBNNN: Jumps to the address NNN plus V0.
-            chip8->PC = chip8->V[0x0] + chip8->inst.NNN;
+            chip8->PC = chip8->V[0x0] + NNN;
             break;
 
         case 0xC:
             // 0xCNNN: Sets VX to the result of a bitwise and operation on a random number (Typically: 0 to 255) and NN.
-            chip8->V[chip8->inst.X] = (rand() % 256) & chip8->inst.NN;
+            chip8->V[X] = (rand() % 256) & NN;
             break;
 
         case 0xD:
@@ -620,11 +642,11 @@ static void emulate_instruction(chip8_t *chip8)
                 and the other part should not reappear on the opposite side of the screen.
             */
 
-            const uint8_t x_start = chip8->V[chip8->inst.X] % SCREEN_WIDTH;
-            const uint8_t y_start = chip8->V[chip8->inst.Y] % SCREEN_HEIGHT;
+            const uint8_t x_start = chip8->V[X] % SCREEN_WIDTH;
+            const uint8_t y_start = chip8->V[Y] % SCREEN_HEIGHT;
 
             const uint8_t x_end = MIN(x_start + 8, SCREEN_WIDTH);
-            const uint8_t y_end = MIN(y_start + chip8->inst.N, SCREEN_HEIGHT);
+            const uint8_t y_end = MIN(y_start + N, SCREEN_HEIGHT);
 
             chip8->V[0xF] = 0;  // Set Carry flag to 0
 
@@ -633,36 +655,34 @@ static void emulate_instruction(chip8_t *chip8)
 
                 for (int x = x_start; x < x_end; x++) {
                     // Get pixels from left to right
-                    uint16_t index = y * SCREEN_WIDTH + x;
-                    bool *pixel = &chip8->display[index];
+                    bool pixel = get_screen_pixel(*chip8, x, y);
                     const bool sprite_bit = sprite_byte & (0x80 >> (x - x_start));
 
                     // XOR display pixel with sprite pixel to set it on or off
-                    *pixel ^= sprite_bit;
+                    pixel ^= sprite_bit;
+                    set_screen_pixel(chip8, x, y, pixel);
                 }
             }
 
             break;
 
         case 0xE:
-            if (chip8->inst.NN == 0x9E) {
+            if (NN == 0x9E) {
                 // 0xEX9E: Skips the next instruction if the key stored in VX is pressed
-                uint8_t VX = chip8->V[chip8->inst.X];
-                if (chip8->keypad[VX])
+                if (chip8->keypad[chip8->V[X]])
                     chip8->PC += 2;
-            } else if (chip8->inst.NN == 0xA1) {
+            } else if (NN == 0xA1) {
                 // 0xEXA1: Skips the next instruction if the key stored in VX is not pressed
-                uint8_t VX = chip8->V[chip8->inst.X];
-                if (!chip8->keypad[VX])
-                chip8->PC += 2;
+                if (!chip8->keypad[chip8->V[X]])
+                    chip8->PC += 2;
             }
             break;
 
         case 0xF:
-            switch (chip8->inst.NN) {
+            switch (NN) {
                 case 0x07:
                     // 0xFX07: Sets VX to the value of the delay timer
-                    chip8->V[chip8->inst.X] = chip8->delay_timer;
+                    chip8->V[X] = chip8->delay_timer;
                     break;
 
                 case 0x0A:
@@ -670,7 +690,7 @@ static void emulate_instruction(chip8_t *chip8)
                     bool key_pressed = false;
                     for (uint8_t key = 0; key < 0xF; key++) {
                         if (chip8->keypad[key]) {
-                            chip8->V[chip8->inst.X] = key;
+                            chip8->V[X] = key;
                             key_pressed = true;
                             break;
                         }
@@ -683,29 +703,29 @@ static void emulate_instruction(chip8_t *chip8)
 
                 case 0x15:
                     // 0xFX15: Sets the delay timer to VX
-                    chip8->delay_timer = chip8->V[chip8->inst.X];
+                    chip8->delay_timer = chip8->V[X];
                     break;
 
                 case 0x18:
                     // 0xFX18: Sets the sound timer to VX
-                    chip8->sound_timer = chip8->V[chip8->inst.X];
+                    chip8->sound_timer = chip8->V[X];
                     break;
 
                 case 0x1E:
                     // 0xFX1E: Adds VX to I. VF is not affected
-                    chip8->I += chip8->V[chip8->inst.X];
+                    chip8->I += chip8->V[X];
                     break;
 
                 case 0x29:
                     // 0xFX29: Sets I to the location of the sprite for the character in VX
-                    chip8->I = 0 + chip8->V[chip8->inst.X] * 5;  // Fonts loaded at address 0 in RAM
+                    chip8->I = FONT_ENTRY_POINT + chip8->V[X] * 5;
                     break;
 
                 case 0x33:
                     // 0xFX33: Stores the binary-coded decimal representation of VX,
                     //         with the hundreds digit in memory at location in I,
                     //         the tens digit at location I+1, and the ones digit at location I+2
-                    uint8_t bcd = chip8->V[chip8->inst.X];
+                    uint8_t bcd = chip8->V[X];
                     chip8->ram[chip8->I + 2] = bcd % 10;  // Ones place
                     bcd /= 10;
                     chip8->ram[chip8->I + 1] = bcd % 10;  // Tens place
@@ -717,7 +737,7 @@ static void emulate_instruction(chip8_t *chip8)
                     // 0xFX55: Stores from V0 to VX (including VX) in memory, starting at address I.
                     //         The offset from I is increased by 1 for each value written,
                     //         but I itself is left unmodified. SCHIP does not increment I, CHIP8 does increment I
-                    for (uint8_t i = 0; i <= chip8->inst.X; i++) {
+                    for (uint8_t i = 0; i <= X; i++) {
                         chip8->ram[chip8->I + i] = chip8->V[i];
                     }
                     break;
@@ -727,7 +747,7 @@ static void emulate_instruction(chip8_t *chip8)
                     //         The offset from I is increased by 1 for each value read, but I itself is left unmodified.
                     //         In the original CHIP-8 implementation, and also in CHIP-48, I is left incremented after
                     //         this instruction had been executed. In SCHIP, I is left unmodified.
-                    for (uint8_t i = 0; i <= chip8->inst.X; i++) {
+                    for (uint8_t i = 0; i <= X; i++) {
                         chip8->V[i] = chip8->ram[chip8->I + i];
                     }
                     break;
@@ -742,11 +762,9 @@ static void emulate_instruction(chip8_t *chip8)
 // Update CHIP8 delay and sound times every 60 hz
 void update_timers(chip8_t *chip8)
 {
-    /*
-        They both count down at 60 hertz, until they reach 0.
-        Delay timer: This timer is intended to be used for timing the events of games. Its value can be set and read.
-        Sound timer: This timer is used for sound effects. When its value is nonzero, a beeping sound is made.
-    */
+    // They both count down at 60 hertz, until they reach 0.
+    // Delay timer: This timer is intended to be used for timing the events of games. Its value can be set and read.
+    // Sound timer: This timer is used for sound effects. When its value is nonzero, a beeping sound is made.
 
     if (chip8->delay_timer > 0)
         chip8->delay_timer--;
@@ -796,7 +814,7 @@ int main(int argc, char **argv)
         const uint64_t start_frame_time = SDL_GetPerformanceCounter();
 
         // Handle user input
-        handle_input(&chip8);
+        process_events(&chip8);
 
         if (chip8.state == PAUSED)
             continue;
@@ -818,6 +836,7 @@ int main(int argc, char **argv)
 
         // Update window with changes for this frame. Updates every 60 hz
         update_screen(sdl, config, chip8);
+
         // Update delay & sound times every 60 hz, i.e, end of each frame
         update_timers(&chip8);
     }
